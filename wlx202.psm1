@@ -1,13 +1,50 @@
+# PowerShell module for WebGUI access YAMAHA WLX202 WiFi Access Point
 #
-# PowerShell module for WebGUI access YAMAHA WLX202
-# 
 # Last update: 2021-3-26
-# created by Jake.Y.Yoshimura
-#    https://github.com/JakeJP
+# created by Jake.Y.Yoshimura, Yokinsoft
+#    https://github.com/JakeJP/WLX202psm
 
 $backupConfig = 'backup.cgi'
 $manageConfig = 'manage-config.html'
 $restoreConfig = 'restore.cgi?manage-config.html'
+
+function Get-WLX202FormFields {
+    param(
+        [Parameter(Mandatory = $true)][string]$html,
+        [string]$formName = 'form_main'
+    )
+
+    $fields = @{}
+    if (-not $html) {
+        return $fields
+    }
+
+    $formPattern = "<form\b[^>]*name\s*=\s*['""]$([regex]::Escape($formName))['""][^>]*>(?<inner>[\s\S]*?)</form>"
+    $source = $html
+    $formMatch = [regex]::Match($html, $formPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if ($formMatch.Success) {
+        $source = $formMatch.Groups['inner'].Value
+    }
+
+    $inputPattern = '<input\\b[^>]*>'
+    $namePattern = '\bname\s*=\s*(?:"(?<name>[^"]+)"|''(?<name>[^'']+)''|(?<name>[^\s>]+))'
+    $valuePattern = '\bvalue\s*=\s*(?:"(?<value>[^"]*)"|''(?<value>[^'']*)''|(?<value>[^\s>]*))'
+
+    foreach ($input in [regex]::Matches($source, $inputPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+        $tag = $input.Value
+        $nameMatch = [regex]::Match($tag, $namePattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if (-not $nameMatch.Success) {
+            continue
+        }
+
+        $key = $nameMatch.Groups['name'].Value
+        $valueMatch = [regex]::Match($tag, $valuePattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        $value = if ($valueMatch.Success) { $valueMatch.Groups['value'].Value } else { '' }
+        $fields[$key] = $value
+    }
+
+    return $fields
+}
 
 #
 function CreateAuthHeader ( [string] $user = "admin", [Parameter(Mandatory)][string]$password ){
@@ -55,7 +92,14 @@ function Backup-WLX202Config {
     )
 
     $Headers = CreateAuthHeader -Password $password
-    $fields = (Invoke-WebRequest -Uri ("http://$remoteHost/$manageConfig") -Headers $Headers).Forms["form_main"].Fields
+    $managePage = Invoke-WebRequest -Uri ("http://$remoteHost/$manageConfig") -Headers $Headers
+    $fields = @{}
+    if ($managePage.Forms -and $managePage.Forms['form_main']) {
+        $fields = @{} + $managePage.Forms['form_main'].Fields
+    }
+    if ($fields.Count -eq 0) {
+        $fields = Get-WLX202FormFields -html $managePage.Content -formName 'form_main'
+    }
     $fields['submit_flag'] = ""
     $config = $null
     $config = [System.Text.Encoding]::UTF8.GetString( (Invoke-WebRequest -Uri "http://$remoteHost/$backupConfig" -Headers $Headers -Method Post -Body $fields -UseBasicParsing ).Content )
@@ -82,11 +126,30 @@ function Restore-WLX202Config {
         return
     }
     ## LOAD manage-config.html
-    $fields = (Invoke-WebRequest -Uri ("http://$remoteHost/$manageConfig") -Headers $Headers).Forms["form_main"].Fields
-    if( -not $fields["time_stamp"] ){
-        return 
+    $Headers = CreateAuthHeader -Password $password
+    $managePage = Invoke-WebRequest -Uri ("http://$remoteHost/$manageConfig") -Headers $Headers
+    $fields = @{}
+    if ($managePage.Forms -and $managePage.Forms['form_main']) {
+        $fields = @{} + $managePage.Forms['form_main'].Fields
     }
-    $timestamp = $fields["time_stamp"]
+    if ($fields.Count -eq 0) {
+        $fields = Get-WLX202FormFields -html $managePage.Content -formName 'form_main'
+    }
+    $timestamp = $fields['time_stamp']
+    if (-not $timestamp) {
+        $timestampMatch = [regex]::Match(
+            $managePage.Content,
+            'name\s*=\s*(?:"time_stamp"|''time_stamp''|time_stamp)\s+value\s*=\s*(?:"(?<value>[^"]+)"|''(?<value>[^'']+)''|(?<value>[^\s>]+))',
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+        if ($timestampMatch.Success) {
+            $timestamp = $timestampMatch.Groups['value'].Value
+        }
+    }
+    if (-not $timestamp) {
+        Write-Error "time_stamp was not found in manage-config response."
+        return
+    }
 
     ## UPLOAD CONTENT
     $LF = "`n"
@@ -107,9 +170,8 @@ function Restore-WLX202Config {
     #$bodyLines
 
     ## RESTORE.CGI
-    $Headers = CreateAuthHeader -Password $password
     $Byte = [System.Text.Encoding]::UTF8.GetBytes($bodyLines)
-    $res = Invoke-WebRequest -Uri "http://$remoteHost/$restoreConfig timestamp=$timestamp" -Method Post -ContentType "multipart/form-data; boundary=`"$boundary`"" -Body $Byte -ErrorAction Stop
+    $res = Invoke-WebRequest -Uri "http://$remoteHost/$restoreConfig timestamp=$timestamp" -Method Post -Headers $Headers -ContentType "multipart/form-data; boundary=`"$boundary`"" -Body $Byte -ErrorAction Stop
     #$res.StatusCode
     #$res.StatusDescription
     return $res
